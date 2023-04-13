@@ -1,1 +1,498 @@
+library(SingleCellExperiment)
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(scales)
+library(cowplot)
+library(RCurl)
+library(HGNChelper)
+library(dplyr)
+
+# How to read in 10X data for a single sample (output is a sparse matrix)
+B1_count <- Read10X(data.dir = "C:/Users/15195/Desktop/Project/Cibersort start from raw data/GSE116222/B1 counts/filtered_feature_bc_matrix/")
+A1_count <- Read10X(data.dir = "C:/Users/15195/Desktop/Project/Cibersort start from raw data/GSE116222/A1 counts/filtered_feature_bc_matrix/")
+C1_count <- Read10X(data.dir = "C:/Users/15195/Desktop/Project/Cibersort start from raw data/GSE116222/C1 counts/filtered_feature_bc_matrix/")
+# Turn count matrix into a Seurat object (output is a Seurat object)
+A1 <- CreateSeuratObject(counts=A1_count,project = "A1", min.cells = 3, min.features = 200)
+##NOTE: The min.features argument specifies the minimum number of genes that need to be detected per cell. This argument will filter out poor quality cells that likely just have random barcodes encapsulated without any cell present.
+##Usually, cells with less than 200 genes detected are not considered for analysis.
+B1 <- CreateSeuratObject(counts=B1_count,project = "B1", min.cells = 3, min.features = 200)
+                         
+C1 <- CreateSeuratObject(counts=C1_count,project = "C1", min.cells = 3, min.features = 200)
+head(A1@meta.data)
+merged_seurat <- merge(x=A1,
+                      y= c(B1,C1),
+                      add.cell.id=c("A1","B1","C1"),
+                      project="GSE116222")
+head(merged_seurat@meta.data)
+tail(merged_seurat@meta.data)
+
+
+
+# Add number of genes per UMI for each cell to metadata
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+
+# Compute percent mito ratio
+merged_seurat$mitoRatio <- PercentageFeatureSet(object = merged_seurat, pattern = "^MT-")
+merged_seurat$mitoRatio <- merged_seurat@meta.data$mitoRatio / 100
+
+# Create metadata dataframe
+metadata <- merged_seurat@meta.data
+# Add cell IDs to metadata
+metadata$cells <- rownames(metadata)
+# Rename columns
+metadata <- metadata %>%
+  dplyr::rename(seq_folder = orig.ident,
+                nUMI = nCount_RNA,
+                nGene = nFeature_RNA)
+# Create sample column
+metadata$sample <- NA
+metadata$sample[which(str_detect(metadata$cells, "^A1_"))] <- "A1"
+metadata$sample[which(str_detect(metadata$cells, "^B1_"))] <- "B1"
+metadata$sample[which(str_detect(metadata$cells, "^C1_"))] <- "C1"
+head(metadata)
+
+# Add metadata back to Seurat object
+merged_seurat@meta.data <- metadata
+# Create .RData object to load at any time
+setwd("C:/Users/15195/Desktop/Project/Cibersort start from raw data/SCT 12Sep 2022/data")
+save(merged_seurat, file="GSE116222_merged_filtered_seurat.RData")
+
+# Visualize the number of cell counts per sample
+metadata %>% 
+  ggplot(aes(x=sample, fill=sample)) + 
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells")
+
+# Visualize the number UMIs/transcripts per cell
+metadata %>% 
+  ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500)
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata %>% 
+  ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  theme_classic() +
+  scale_x_log10() + 
+  geom_vline(xintercept = 300)
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata %>% 
+  ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  geom_boxplot() + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells vs NGenes")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~sample)
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata %>% 
+  ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 0.2)
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI
+metadata %>%
+  ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)
+# Filter out low quality reads using selected thresholds - these will change with experiment
+filtered_seurat <- subset(x = merged_seurat, 
+                          subset= (nUMI >= 500) & 
+                            (nGene >= 250) & 
+                            (log10GenesPerUMI > 0.80) & 
+                            (mitoRatio < 0.20))
+
+####Gene-level filtering
+# Output a logical vector for every gene on whether the more than zero counts per cell
+# Extract counts
+counts <- GetAssayData(object = filtered_seurat, slot = "counts")
+
+# Output a logical vector for every gene on whether the more than zero counts per cell
+nonzero <- counts > 0
+
+# Sums all TRUE values and returns TRUE if more than 10 TRUE values per gene
+keep_genes <- Matrix::rowSums(nonzero) >= 10
+
+# Only keeping those genes expressed in more than 10 cells
+filtered_counts <- counts[keep_genes, ]
+
+# Reassign to filtered Seurat object
+filtered_seurat <- CreateSeuratObject(filtered_counts, meta.data = filtered_seurat@meta.data)
+
+# Save filtered subset to new metadata
+metadata_clean <- filtered_seurat@meta.data
+
+##Perform all of the same plots as with the unfiltered data and determine whether the thresholds used were appropriate.
+metadata_clean %>% 
+  ggplot(aes(x=sample, fill=sample)) + 
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells")
+
+# Visualize the number UMIs/transcripts per cell
+metadata_clean %>% 
+  ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500)
+
+# Visualize the distribution of genes detected per cell via histogram
+metadata_clean %>% 
+  ggplot(aes(color=sample, x=nGene, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  theme_classic() +
+  scale_x_log10() + 
+  geom_vline(xintercept = 300)
+
+
+# Visualize the distribution of genes detected per cell via boxplot
+metadata_clean %>% 
+  ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  geom_boxplot() + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("NCells vs NGenes")
+
+# Visualize the correlation between genes detected and number of UMIs and determine whether strong presence of cells with low numbers of genes/UMIs
+metadata_clean %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "gray90", high = "black") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~sample)
+# Visualize the distribution of mitochondrial gene expression detected per cell
+metadata_clean %>% 
+  ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 0.2)
+# Visualize the overall complexity of the gene expression by visualizing the genes detected per UMI
+metadata_clean %>%
+  ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8)
+
+# Create .RData object to load at any time
+save(filtered_seurat, file="GSE116222_seurat_filtered.RData")
+
+
+# Normalize the counts
+seurat_phase <- NormalizeData(filtered_seurat,normalization.method = "LogNormalize", scale.factor = 10000)
+
+# A list of cell cycle markers, from Tirosh et al, 2015, is loaded with Seurat.  We can
+# segregate this list into markers of G2/M phase and markers of S phase
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+# Perform cell cycle scoring
+seurat_phase <- CellCycleScoring(seurat_phase, 
+                                 g2m.features = g2m.genes, 
+                                 s.features = s.genes)
+# View cell cycle scores and phases assigned to cells                                 
+View(seurat_phase@meta.data)   
+# Identify the most variable genes
+seurat_phase <- FindVariableFeatures(seurat_phase, 
+                                     selection.method = "vst",
+                                     nfeatures = 2000, 
+                                     verbose = FALSE)
+
+# Scale the counts
+seurat_phase <- ScaleData(seurat_phase,features = rownames(seurat_phase))
+
+# Perform PCA
+seurat_phase <- RunPCA(seurat_phase)
+
+# Plot the PCA colored by cell cycle phase
+DimPlot(seurat_phase,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+
+#SCTransform
+options(future.globals.maxSize = 4000 * 1024^2)
+# Split seurat object by condition to perform cell cycle scoring and SCT on all samples
+split_seurat <- SplitObject(filtered_seurat, split.by = "sample")
+
+split_seurat <- split_seurat[c("A1", "B1","C1")]
+for (i in 1:length(split_seurat)) {
+  split_seurat[[i]] <- NormalizeData(split_seurat[[i]], verbose = TRUE)
+  split_seurat[[i]] <- CellCycleScoring(split_seurat[[i]], g2m.features=g2m.genes, s.features=s.genes)
+  split_seurat[[i]] <- SCTransform(split_seurat[[i]], vars.to.regress = c("mitoRatio"))
+}
+# Check which assays are stored in objects
+split_seurat$A1@assays
+
+# Select the most variable features to use for integration
+integ_features <- SelectIntegrationFeatures(object.list = split_seurat, 
+                                            nfeatures = 3000) 
+
+# Prepare the SCT list object for integration
+split_seurat <- PrepSCTIntegration(object.list = split_seurat, 
+                                   anchor.features = integ_features)
+# Find best buddies - can take a while to run
+integ_anchors <- FindIntegrationAnchors(object.list = split_seurat, 
+                                        normalization.method = "SCT", 
+                                        anchor.features = integ_features)
+# Integrate across conditions
+seurat_integrated <- IntegrateData(anchorset = integ_anchors, 
+                                   normalization.method = "SCT")
+# Save integrated seurat object
+saveRDS(seurat_integrated, "GSE116222_integrated_seurat.rds")
+
+# Run PCA
+seurat_integrated <- ScaleData(seurat_integrated, features = rownames(seurat_integrated))
+seurat_integrated <- RunPCA(object = seurat_integrated)
+
+# Plot PCA
+PCAPlot(seurat_integrated,
+        split.by = "sample")  
+
+# Run UMAP
+seurat_integrated <- RunUMAP(seurat_integrated, 
+                             dims = 1:40,
+                             reduction = "pca")
+
+# Plot UMAP                             
+DimPlot(seurat_integrated, split.by = "sample")  
+
+
+#clustering
+DimHeatmap(seurat_integrated, 
+           dims = 1:9, 
+           cells = 500, 
+           balanced = TRUE)
+# Printing out the most variable genes driving PCs
+print(x = seurat_integrated[["pca"]], 
+      dims = 1:10, 
+      nfeatures = 5)
+# Plot the elbow plot
+ElbowPlot(object = seurat_integrated, 
+          ndims = 40)
+##a more quantitative manner
+# Determine percent of variation associated with each PC
+pct <- seurat_integrated[["pca"]]@stdev / sum(seurat_integrated[["pca"]]@stdev) * 100
+
+# Calculate cumulative percents for each PC
+cumu <- cumsum(pct)
+
+# Determine which PC exhibits cumulative percent greater than 90% and % variation associated with the PC as less than 5
+co1 <- which(cumu > 90 & pct < 5)[1]
+
+co1
+# Determine the difference between variation of PC and subsequent PC
+co2 <- sort(which((pct[1:length(pct) - 1] - pct[2:length(pct)]) > 0.1), decreasing = T)[1] + 1
+
+# last point where change of % of variation is more than 0.1%.
+co2
+# Minimum of the two calculation
+pcs <- min(co1, co2)
+
+pcs
+# Create a dataframe with values
+plot_df <- data.frame(pct = pct, 
+                      cumu = cumu, 
+                      rank = 1:length(pct))
+
+# Elbow plot to visualize 
+ggplot(plot_df, aes(cumu, pct, label = rank, color = rank > pcs)) + 
+  geom_text() + 
+  geom_vline(xintercept = 90, color = "grey") + 
+  geom_hline(yintercept = min(pct[pct > 5]), color = "grey") +
+  theme_bw()
+
+# Determine the K-nearest neighbor graph
+seurat_integrated <- FindNeighbors(object = seurat_integrated, 
+                                   dims = 1:17)
+# Determine the clusters for various resolutions                                
+seurat_integrated <- FindClusters(object = seurat_integrated,
+                                  resolution = c(0.4, 0.6, 0.8, 1.0, 1.4))
+# Explore resolutions
+seurat_integrated@meta.data %>% 
+  View()
+# Assign identity of clusters
+Idents(object = seurat_integrated) <- "integrated_snn_res.0.8"
+# Plot the UMAP
+DimPlot(seurat_integrated,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 6)
+# Assign identity of clusters
+Idents(object = seurat_integrated) <- "integrated_snn_res.0.4"
+
+# Plot the UMAP
+DimPlot(seurat_integrated,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 6)
+
+# Extract identity and sample information from seurat object to determine the number of cells per cluster per sample
+n_cells <- FetchData(seurat_integrated, 
+                     vars = c("ident", "orig.ident")) %>%
+  dplyr::count(ident, orig.ident) %>%
+  tidyr::spread(ident, n)
+
+# View table
+View(n_cells)
+
+# UMAP of cells in each cluster by sample
+DimPlot(seurat_integrated, 
+          label = TRUE, 
+          split.by = "sample")  + NoLegend()
+
+# Explore whether clusters segregate by cell cycle phase
+DimPlot(seurat_integrated,
+        label = TRUE, 
+        split.by = "Phase")  + NoLegend()
+
+# Determine metrics to plot present in seurat_integrated@meta.data
+metrics <-  c("nUMI", "nGene", "S.Score", "G2M.Score", "mitoRatio")
+
+FeaturePlot(seurat_integrated, 
+            reduction = "umap", 
+            features = metrics,
+            pt.size = 0.4, 
+            sort.cell = TRUE,
+            min.cutoff = 'q10',
+            label = TRUE)
+
+
+#annotation
+# load gene set preparation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/gene_sets_prepare.R")
+# load cell type annotation function
+source("https://raw.githubusercontent.com/IanevskiAleksandr/sc-type/master/R/sctype_score_.R")
+
+# DB file
+db_ = "C:/Users/15195/Desktop/Project/Cibersort start from raw data/Figure and data of cluster and annation/ScTypeDB_full_1.xlsx";
+tissue = "Gastrointestinal tract" 
+
+
+# prepare gene sets
+gs_list = gene_sets_prepare(db_, tissue)
+# get cell-type by cell matrix
+es.max = sctype_score(scRNAseqData = seurat_integrated[["integrated"]]@scale.data, scaled = TRUE, 
+                      gs = gs_list$gs_positive, gs2 = gs_list$gs_negative) 
+
+# merge by cluster
+cL_resutls = do.call("rbind", lapply(unique(seurat_integrated@meta.data$integrated_snn_res.0.4), function(cl){
+  es.max.cl = sort(rowSums(es.max[ ,rownames(seurat_integrated@meta.data[seurat_integrated@meta.data$integrated_snn_res.0.4==cl, ])]), decreasing = !0)
+  head(data.frame(cluster = cl, type = names(es.max.cl), scores = es.max.cl, ncells = sum(seurat_integrated@meta.data$integrated_snn_res.0.4==cl)), 10)
+}))
+sctype_scores = cL_resutls %>% group_by(cluster) %>% top_n(n = 1, wt = scores)  
+#overlay the identified cell types on UMAP plot:
+seurat_integrated@meta.data$customclassif = ""
+for(j in unique(sctype_scores$cluster)){
+  cl_type = sctype_scores[sctype_scores$cluster==j,]; 
+  seurat_integrated@meta.data$customclassif[seurat_integrated@meta.data$integrated_snn_res.0.4 == j] = as.character(cl_type$type[1])
+}
+
+DimPlot(seurat_integrated, reduction = "umap", label = TRUE, repel = TRUE, group.by = 'customclassif')   
+print(sctype_scores[1:11,1:3])
+
+## Combine the annotation to raw data counts
+Cibersort_raw<- seurat_integrated[["RNA"]]@counts
+colnames(Cibersort_raw) <- seurat_integrated@meta.data$customclassif
+setwd("C:/Users/15195/Desktop/Project/Cibersort start from raw data/SCT 12Sep 2022/data")
+write.table(Cibersort_raw,"Cibersortraw25993.txt",quote = F,sep="\t")
+
+Cibersort_3000 <- seurat_integrated[["integrated"]]@data
+colnames(Cibersort_3000) <- seurat_integrated@meta.data$customclassif
+setwd("C:/Users/15195/Desktop/Project/Cibersort start from raw data/SCT 12Sep 2022/data")
+write.table(Cibersort_3000,"Cibersort3000.txt",quote = F,sep="\t")
+
+##Change the cell names to short format
+sc1 <- read.delim("Cibersortraw25993.txt",sep="\t",check.names = F)
+
+colnames(sc1)[grep("Crypt" , colnames(sc1))] <- "CTC"
+colnames(sc1)[grep("Colonocytes" , colnames(sc1))] <- "CC"
+colnames(sc1)[grep("T.cells" , colnames(sc1))] <- "TC"
+colnames(sc1)[grep("Undifferentiated1" , colnames(sc1))] <- "U1"
+colnames(sc1)[grep("Goblet" , colnames(sc1))] <- "GC"
+colnames(sc1)[grep("BEST4" , colnames(sc1))] <- "BOC"
+colnames(sc1)[grep("Enteroendocrine" , colnames(sc1))] <- "EEC"
+colnames(sc1)[grep("Undifferentiated2" , colnames(sc1))] <- "U2"
+colnames(sc1)[grep("ILCs" , colnames(sc1))] <- "ILCs"
+colnames(sc1)[grep("Mast" , colnames(sc1))] <- "MC"
+unique(colnames(sc1))
+sc1[1:3,1:3]
+max(sc1)
+write.table(sc1,"SCbeforereducesymbol25993.txt",quote = F,sep="\t")
+
+###reduce genesmybol according to gene in bulktissue gene
+##baseline data from processed one
+setwd("C:/Users/15195/Desktop/Project/Main results_Cibersortx work_14Feb2022/PHYTOME log data downed from GEO and processed/Baseline")
+base <- read.delim("basefinal.txt",check.names = F,sep="\t")
+scda <- sc1
+dim(sc1)
+d<-intersect(rownames(scda),base$Gene)
+tscda <- t(scda)
+newtscda<-tscda[,colnames(tscda) %in% d]
+colnames(tscda)[1]
+new <- as.data.frame(newtscda)
+new[1:3,1:3]
+dim(new)
+
+### change the data from to upload to CIBERSORTx
+rownames(new)<- NULL
+rownames(new)<-gsub("\\..*", "", colnames(scda))
+colnames(scda) <- gsub("\\..*", "", colnames(scda))
+colnames(scda)[1:5]
+new[1:3,1:3]
+gene <- colnames(scda)
+new3 <- cbind(gene,new)
+new3[1:6,1:3]
+dim(new3)
+max(new3[1:6986,2:9343])
+min(new3[1:6986,2:9343])
+setwd("C:/Users/15195/Desktop/Project/Cibersort start from raw data/SCT 12Sep 2022/data")
+write.table(t(new3),"full2sc25993.txt",col.names = F,quote = F,sep="\t")
+
+
+###just select the most variable 3000 features and find which included for cibersortx
+sc3000 <- read.delim("full2Cibersort3000.txt",check.names = F,sep="\t")
+sc3000[1:4,1:3]
+rownames(new3)[1]
+colnames(new3)[1]
+rownames(sc3000)[1]
+d2<-intersect(rownames(sc3000),colnames(new3))
+new4 <- new3[,colnames(new3) %in% d2]
+new4[1:4,1:3]
+new5 <- cbind(gene,new4)
+new5[1:4,1:3]
+write.table(t(new5),"full2sc3000.txt",col.names = F,quote = F,sep="\t")
+
 
